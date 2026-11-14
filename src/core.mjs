@@ -8,10 +8,10 @@ import { appendServerLog, logRoute } from './logs.mjs';
 export const API = '/api/server/v1';
 const nativeOrigins = ['app://tatakai.me', 'capacitor://localhost', 'http://localhost', 'https://localhost'];
 export const defaults = { name: 'Tatakai Server', languages: [], timeoutMs: 25000, concurrency: 4,
-  cacheSeconds: 300, mediaCacheMb: 32, mediaCacheSeconds: 300, proxyEnabled: true, allowedOrigins: ['https://tatakai.me', 'https://www.tatakai.me', ...nativeOrigins] };
+  cacheSeconds: 300, mediaCacheMb: 32, mediaCacheSeconds: 300, proxyEnabled: true, allowedOrigins: ['https://tatakai.me', 'https://www.tatakai.me', 'https://tatakai.app', 'https://www.tatakai.app', ...nativeOrigins] };
 const redactExtension = row => ({ id: row.id, manifestId: row.manifest.id, ecosystem: row.ecosystem, name: row.manifest.name, version: row.manifest.version,
   enabled: row.enabled, priority: row.priority, languages: row.languages, kind: row.kind, updatedAt: row.updatedAt,
-  hasPreferences: !!row.preferences, runtime: row.runtime || 'interpreter' });
+  hasPreferences: !!row.preferences, runtime: row.runtime || 'interpreter', autoResolve: row.autoResolve !== false });
 function settings(input, current = defaults) {
   const out = { ...current };
   if (input.name !== undefined) { if (typeof input.name !== 'string' || !input.name.trim() || input.name.length > 100) fail(400, 'invalid_name'); out.name = input.name.trim(); }
@@ -31,13 +31,13 @@ function settings(input, current = defaults) {
   }
   return out;
 }
-export async function createServer({ store, artifacts, secret, bootstrapSecret, platform = 'node', network = createNetwork(), interpreter, nodeInterpreter, hosts = {}, staticResponse, legacyVerify }) {
+export async function createServer({ store, artifacts, secret, bootstrapSecret, platform = 'node', network = createNetwork(), interpreter, nodeInterpreter, hosts = {}, staticResponse, legacyVerify, mediaProxyUrl, mediaProxyPassword, persistentLookupCache, originRelayHosts }) {
   const startedAt = Date.now(), startedClock = performance.now();
   const encryption = await vault(secret);
   const extensions = createExtensions({ network, artifacts, interpreter, nodeInterpreter, platform, hosts, vault: encryption });
-  const lookups = createLookupCache();
+  const lookups = createLookupCache({ persistence: persistentLookupCache });
   const mediaCache = createMediaCache({ store, artifacts, vault: encryption });
-  const proxy = createProxy({ vault: encryption, network, platform, cache: mediaCache });
+  const proxy = createProxy({ vault: encryption, network, platform, cache: mediaCache, mediaProxyUrl, mediaProxyPassword, originRelayHosts });
   const sourceRows = async state => [...state.extensions, ...(hosts.catalog ? await hosts.catalog.list() : [])];
   const checkPassword = (value, stored) => stored?.legacyHash && legacyVerify ? (typeof value === 'string' && value.length <= 1024 ? legacyVerify(value, stored) : false) : verifyPassword(value, stored);
   async function edit(fn) { return store.mutate(async state => { if (!state) fail(409, 'setup_required'); return { state, value: await fn(state) }; }); }
@@ -73,7 +73,7 @@ export async function createServer({ store, artifacts, secret, bootstrapSecret, 
         if (!state.settings.proxyEnabled) fail(409, 'proxy_disabled', 'Enable the proxy to access source media');
         let headers = out.headers || inherited?.headers || {};
         if (!out.headers && inherited?.url && /^https?:/.test(inherited.url) && /^https?:/.test(out[key]) && new URL(inherited.url).origin !== new URL(out[key]).origin) headers = stripCredentials(headers);
-        out[key] = await proxy.mint({ url: out[key], headers }, base, session.id);
+        out[key] = await proxy.mint({ url: out[key], headers, ...(key !== 'url' ? { resourceType: 'image' } : {}) }, base, session.id);
       }
     }
     delete out.headers; delete out.originalUrl; delete out.behaviorHints;
@@ -96,9 +96,9 @@ export async function createServer({ store, artifacts, secret, bootstrapSecret, 
     }
     return extensions.invoke(row, op, args, signal, onProgress);
   }
-  async function invoke(row, op, args, signal, state, progressive = false) {
+  async function invoke(row, op, args, signal, state, progressive = false, onProgress) {
     const seconds = state?.settings.cacheSeconds || 0;
-    if (!seconds || !['browse', 'search', 'info', 'episodes', 'chapters', 'novelChapters', 'novelContent'].includes(op)) return invokeRaw(row, op, args, signal);
+    if (!seconds || args.forceRefresh === true || !['browse', 'search', 'info', 'episodes', 'chapters', 'pages', 'novelChapters', 'novelContent', 'resolve'].includes(op)) return invokeRaw(row, op, args, signal, onProgress);
     const key = await digest(JSON.stringify([row.id, row.updatedAt, row.preferences, op, args]));
     const cached = state.cache?.[key];
     if (cached?.expires > Date.now()) { const value = await encryption.open(cached.value); return progressive ? {chapters:value,partial:false} : value; }
@@ -107,7 +107,7 @@ export async function createServer({ store, artifacts, secret, bootstrapSecret, 
     return lookups.get(key, async publish => {
       const result = await invokeRaw(row, op, args, AbortSignal.timeout(state.settings.timeoutMs), publish);
       const serialized = JSON.stringify(result);
-      if (serialized && serialized.length <= 16 * 1024) {
+      if (!persistentLookupCache && op !== 'resolve' && serialized && serialized.length <= 16 * 1024) {
         const encrypted = await encryption.seal(result);
         await edit(current => {
           current.cache ||= {};
@@ -118,7 +118,7 @@ export async function createServer({ store, artifacts, secret, bootstrapSecret, 
         });
       }
       return result;
-    }, seconds * 1000, signal, progressive);
+    }, ['resolve', 'pages'].includes(op) ? Math.min(seconds * 1000, 120000) : seconds * 1000, signal, progressive, onProgress);
   }
   async function dispatch(request, state, url) {
     const path = url.pathname.slice(API.length), method = request.method;
@@ -172,8 +172,8 @@ export async function createServer({ store, artifacts, secret, bootstrapSecret, 
     if (path === '/cache' && method === 'GET') return { lookupEntries: Object.values(state.cache || {}).filter(item => item.expires > Date.now()).length,
       mediaEntries: Object.values(state.mediaCache || {}).filter(item => item.expires > Date.now()).length,
       mediaBytes: Object.values(state.mediaCache || {}).filter(item => item.expires > Date.now()).reduce((sum, item) => sum + item.bytes, 0),
-      maxMediaBytes: (state.settings.mediaCacheMb || 0) * 1024 * 1024 };
-    if (path === '/cache' && method === 'DELETE') { lookups.clear(); await mediaCache.clear(); return { success: true }; }
+      maxMediaBytes: (state.settings.mediaCacheMb || 0) * 1024 * 1024, responseCache: persistentLookupCache?.stats() || null };
+    if (path === '/cache' && method === 'DELETE') { await lookups.clear(); await mediaCache.clear(); return { success: true }; }
     if (path === '/native' && method === 'POST') {
       if (!hosts.catalog?.manage) fail(422, 'unsupported_runtime', 'Native extension management requires the optional Node runtime or desktop');
       return hosts.catalog.manage(await body(request), request.signal);
@@ -205,7 +205,7 @@ export async function createServer({ store, artifacts, secret, bootstrapSecret, 
     if (path === '/extensions' && method === 'GET') return state.extensions.map(redactExtension);
     if (path === '/extensions' && method === 'POST') {
       const input = await body(request), prepared = await extensions.prepare(input, request.signal);
-      try { await edit(current => { if (current.extensions.length >= 250) fail(409, 'extension_limit'); current.extensions.push(prepared); }); }
+      try { await edit(current => { if (current.extensions.length >= 512) fail(409, 'extension_limit'); current.extensions.push(prepared); }); }
       catch (error) { if (prepared.artifact) await artifacts.remove(prepared.artifact); throw error; }
       return redactExtension(prepared);
     }
@@ -216,7 +216,7 @@ export async function createServer({ store, artifacts, secret, bootstrapSecret, 
       if (extensionPath[2] === 'update' && method === 'POST') {
         const input = await body(request);
         const prepared = await extensions.prepare({ ...input, runtime: input.runtime || row.runtime, id: row.id, url: input.url || (row.origin && await encryption.open(row.origin)), ecosystem: row.ecosystem, preferences: await encryption.open(row.preferences) }, request.signal);
-        try { await edit(current => { const index = current.extensions.findIndex(item => item.id === row.id); if (index < 0 || current.extensions[index].updatedAt !== row.updatedAt) fail(409, 'configuration_conflict'); current.extensions[index] = { ...prepared, enabled: row.enabled, priority: row.priority, languages: row.languages, kind: row.kind }; }); }
+        try { await edit(current => { const index = current.extensions.findIndex(item => item.id === row.id); if (index < 0 || current.extensions[index].updatedAt !== row.updatedAt) fail(409, 'configuration_conflict'); current.extensions[index] = { ...prepared, enabled: row.enabled, priority: row.priority, languages: row.languages, kind: row.kind, autoResolve: row.autoResolve !== false }; }); }
         catch (error) { if (prepared.artifact) await artifacts.remove(prepared.artifact); throw error; }
         return redactExtension(prepared);
       }
@@ -224,11 +224,12 @@ export async function createServer({ store, artifacts, secret, bootstrapSecret, 
       if (method === 'PATCH') {
         const input = await body(request);
         if (input.enabled !== undefined && typeof input.enabled !== 'boolean') fail(400, 'invalid_setting');
+        if (input.autoResolve !== undefined && typeof input.autoResolve !== 'boolean') fail(400, 'invalid_setting');
         if (input.priority !== undefined && (!Number.isInteger(input.priority) || Math.abs(input.priority) > 1000)) fail(400, 'invalid_priority');
         if (input.languages !== undefined && (!Array.isArray(input.languages) || input.languages.some(v => typeof v !== 'string'))) fail(400, 'invalid_languages');
         if (input.preferences !== undefined && JSON.stringify(input.preferences).length > 8192) fail(413, 'preferences_too_large');
         const preferences = input.preferences === undefined ? undefined : await encryption.seal(input.preferences);
-        return edit(current => { const item = current.extensions.find(v => v.id === row.id); if (!item) fail(404, 'extension_not_found'); for (const key of ['enabled', 'priority', 'languages']) if (input[key] !== undefined) item[key] = input[key]; if (preferences) item.preferences = preferences; return redactExtension(item); });
+        return edit(current => { const item = current.extensions.find(v => v.id === row.id); if (!item) fail(404, 'extension_not_found'); for (const key of ['enabled', 'autoResolve', 'priority', 'languages']) if (input[key] !== undefined) item[key] = input[key]; if (preferences) item.preferences = preferences; return redactExtension(item); });
       }
     }
     if (path === '/repositories') {
@@ -261,7 +262,9 @@ export async function createServer({ store, artifacts, secret, bootstrapSecret, 
       return proxify(result, base, session, state);
     }
     if (path === '/resolve' && method === 'POST') {
-      const input = await body(request), rows = (await sourceRows(state)).filter(row => row.enabled && row.kind !== 'read' && (!state.settings.languages.length || !row.languages.length || row.languages.some(lang => state.settings.languages.includes(lang)))).sort((a, b) => b.priority - a.priority);
+      const input = await body(request), rows = (await sourceRows(state)).filter(row => row.enabled && row.autoResolve !== false && row.kind !== 'read'
+        && (row.ecosystem !== 'stremio' || (row.manifest.resources || []).some(resource => (typeof resource === 'string' ? resource : resource.name) === 'stream'))
+        && (!state.settings.languages.length || !row.languages.length || row.languages.some(lang => state.settings.languages.includes(lang)))).sort((a, b) => b.priority - a.priority);
       const signal = AbortSignal.any([request.signal, AbortSignal.timeout(state.settings.timeoutMs)]);
       const run = async publish => {
         const sources = [], statuses = rows.map(row => ({ provider: `${state.id}/${row.id}`, name: row.manifest.name, ecosystem: row.ecosystem, kind: 'anime', status: 'loading', count: 0, durationMs: 0 })); let next = 0;
@@ -288,7 +291,7 @@ export async function createServer({ store, artifacts, secret, bootstrapSecret, 
               }).catch(error => { publicationError = error; });
             };
             try {
-              const result = await invokeRaw(row, 'resolve', input, signal, append);
+              const result = await invoke(row, 'resolve', input, signal, state, false, append);
               append(Array.isArray(result) ? result : result?.sources || []); await publication;
               if (publicationError) throw publicationError;
               status.status = status.count ? 'ok' : 'empty';

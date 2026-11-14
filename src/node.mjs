@@ -13,6 +13,7 @@ import { nodeNetwork } from './node-network.mjs';
 import { nodeInterpreter } from './node-extension.mjs';
 import { resolveNodeSecrets } from './node-secrets.mjs';
 import { startupBanner } from './startup-banner.mjs';
+import { createFileLookupCache } from './file-lookup-cache.mjs';
 
 export async function serveNodeRequest(handler, req, res, base) {
   const abort = new AbortController();
@@ -48,6 +49,7 @@ export async function startNode(options = {}) {
   const { interpreter } = await import('../dist/interpreter.mjs');
   const publicNetwork = nodeNetwork();
   const secret = secrets.secret, encryption = await vault(secret);
+  const persistentLookupCache = await createFileLookupCache({ root: path.join(root, 'response-cache'), vault: encryption });
   let broker;
   const network = async (url, init) => {
     if (url.startsWith('tatakai-native:')) {
@@ -74,6 +76,10 @@ export async function startNode(options = {}) {
   }
   const ui = fileURLToPath(new URL('../dist/ui/', import.meta.url));
   const handler = await createServer({ ...storage, platform: 'node', interpreter, nodeInterpreter, network,
+    persistentLookupCache,
+    mediaProxyUrl: options.mediaProxyUrl || process.env.MEDIA_PROXY_URL,
+    mediaProxyPassword: options.mediaProxyPassword || process.env.MEDIA_PROXY_PASSWORD,
+    originRelayHosts: options.originRelayHosts || process.env.ORIGIN_RELAY_HOSTS,
     secret, bootstrapSecret: secrets.bootstrapSecret,
     hosts, staticResponse: async request => {
       const pathname = decodeURIComponent(new URL(request.url).pathname);

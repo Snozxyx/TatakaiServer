@@ -48,7 +48,13 @@ export async function vault(secret) {
 export function publicUrl(value) {
   let url; try { url = new URL(value); } catch { fail(400, 'invalid_url'); }
   const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || (url.port && !['80', '443'].includes(url.port))) fail(400, 'invalid_url');
+  // These public video CDNs issue HTTPS media links on dedicated ports.
+  // Keep the exception tied to both hostname and port; DNS/private-IP guards
+  // below and the actual socket-address validation remain in force.
+  const mediaPort = url.protocol === 'https:' && [
+    ['mp4upload.com', '183'], ['vidcache.net', '8161'],
+  ].some(([domain, port]) => url.port === port && (host === domain || host.endsWith('.' + domain)));
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || (url.port && !['80', '443'].includes(url.port) && !mediaPort)) fail(400, 'invalid_url');
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal') || host === 'metadata.google.internal') fail(403, 'private_upstream');
   if (host.includes(':')) {
     // Only global unicast IPv6; excludes loopback, mapped IPv4, ULA and link-local.

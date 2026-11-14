@@ -43,6 +43,7 @@ interface ServerConfig {
 }
 
 interface ExtensionItem {
+  autoResolve?: boolean;
   id: string;
   manifestId?: string;
   name: string;
@@ -68,6 +69,7 @@ interface RepositoryItem {
 }
 
 interface CacheStats {
+  responseCache?: { entries: number; bytes: number; maxBytes: number };
   lookupEntries: number;
   mediaEntries: number;
   mediaBytes: number;
@@ -1202,6 +1204,7 @@ function App() {
                                         void action(async () => {
                                           await api('/extensions/' + row.id, 'PATCH', {
                                             priority: Number(input.priority),
+                                            autoResolve: input.autoResolve === 'on',
                                             languages: String(input.languages)
                                               .split(',')
                                               .map(v => v.trim())
@@ -1233,6 +1236,10 @@ function App() {
                                           />
                                         </Field>
                                       </div>
+                                      <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                                        <input type="checkbox" name="autoResolve" defaultChecked={row.autoResolve !== false} />
+                                        Include in automatic source lookup
+                                      </label>
                                       <div>
                                         <Button size="sm" variant="secondary" disabled={busy}>
                                           Save Routing
@@ -1783,7 +1790,7 @@ function App() {
                     </div>
 
                     <p className="text-xs text-muted-foreground">In Tatakai, open Settings → Extension Hub → Extension Servers and set the extension API to the Server Origin above.</p>
-                    <Button asChild variant="outline" className="w-full"><a href={`${location.protocol === 'http:' ? 'http://localhost:8090' : 'https://tatakai.me'}/extensionserver/${encodeURIComponent(location.origin)}`} target="_blank" rel="noreferrer">Set extension API in Tatakai</a></Button>
+                    <Button asChild variant="outline" className="w-full"><a href={`${location.protocol === 'http:' ? 'http://localhost:8090' : 'https://tatakai.app'}/extensionserver/${encodeURIComponent(location.origin)}`} target="_blank" rel="noreferrer">Set extension API in Tatakai</a></Button>
 
                     <Button
                       disabled={busy}
@@ -2112,16 +2119,16 @@ function App() {
                 {/* 4. Cache Telemetry */}
                 <SettingsSection
                   title="Cache Telemetry"
-                  description="Small media segments, subtitles, and lookups are cached privately in memory. Live HLS playlists bypass cache."
+                  description="Extension responses are cached as encrypted JSON on disk and in memory. Playback results expire within two minutes; fresh media tickets are issued for each viewer. Live HLS playlists bypass cache."
                 >
                   <div className="rounded-xl border border-border/80 bg-card p-5 shadow-xs space-y-4">
                     {cache && (
                       <>
                         <div className="grid grid-cols-3 gap-3 text-xs">
                           <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
-                            <span className="text-muted-foreground">Cached Lookups</span>
+                            <span className="text-muted-foreground">Cached JSON responses</span>
                             <p className="mt-1 font-mono text-base font-semibold tabular-nums">
-                              {cache.lookupEntries}
+                              {cache.lookupEntries + (cache.responseCache?.entries || 0)}
                             </p>
                           </div>
                           <div className="rounded-lg border border-border/60 bg-muted/20 p-3">

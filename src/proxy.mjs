@@ -1,9 +1,33 @@
 import { fail, cleanHeaders, stripCredentials, limitedText, limitedBytes, digest } from './security.mjs';
-export function createProxy({ vault, network, platform, cache }) {
+export function createProxy({ vault, network, platform, cache, mediaProxyUrl, mediaProxyPassword, originRelayHosts = [] }) {
+  const relayHosts = (Array.isArray(originRelayHosts) ? originRelayHosts : String(originRelayHosts).split(',')).map(host => String(host).trim().toLowerCase()).filter(Boolean);
+  const edgeUrl = (target, headers = {}) => {
+    const url = new URL(mediaProxyUrl);
+    if (url.protocol !== 'https:' || url.username || url.password || url.hash) fail(500, 'invalid_media_proxy');
+    url.searchParams.set('url', target);
+    for (const [key, value] of Object.entries(headers)) {
+      if (key.toLowerCase() === 'referer') url.searchParams.set('referer', value);
+      if (key.toLowerCase() === 'user-agent') url.searchParams.set('userAgent', value);
+    }
+    if (mediaProxyPassword) url.searchParams.set('password', mediaProxyPassword);
+    return url.href;
+  };
   async function mint(entry, base, sessionId, lifetime = 6 * 60 * 60 * 1000) {
     if (typeof entry.url !== 'string' || entry.url.length > 16384) fail(413, 'media_url_too_large');
+    // Public media belongs at the edge; private headers and internal native
+    // resources retain the encrypted, revocable server-ticket path.
+    const headers = cleanHeaders(entry.headers);
+    const host = /^https?:\/\//i.test(entry.url) ? new URL(entry.url).hostname.toLowerCase() : '';
+    const originRequired = relayHosts.some(suffix => host === suffix || host.endsWith('.' + suffix));
+    if (mediaProxyUrl && !originRequired && entry.resourceType !== 'image' && /^https?:\/\//i.test(entry.url) && Object.keys(headers).every(key =>
+      ['referer', 'user-agent', 'accept', 'accept-language'].includes(key.toLowerCase()))) {
+      return edgeUrl(entry.url, headers);
+    }
     const ticket = await vault.seal({ ...entry, sessionId, expires: Date.now() + lifetime });
-    return `${base}/api/server/v1/media/${ticket}`;
+    const url = `${base}/api/server/v1/media/${ticket}`;
+    // Image hosts commonly block edge IPs. Preserve their working origin relay
+    // and private header replay; large public video bodies still use Hoko.
+    return url;
   }
   async function serve(request, ticket, base, state) {
     const entry = await vault.open(ticket);

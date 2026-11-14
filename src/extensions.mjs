@@ -22,7 +22,7 @@ const METHODS = {
 export function sourceDescriptor(row, serverId, platform, hosts) {
   const support = capability(row.ecosystem, platform, hosts);
   return { id: `${serverId}/${row.id}`, extensionId: row.id, name: row.manifest.name, ecosystem: row.ecosystem,
-    enabled: row.enabled, priority: row.priority, languages: row.languages, kind: row.kind || 'watch', ...support };
+    enabled: row.enabled, priority: row.priority, languages: row.languages, kind: row.kind || 'watch', autoResolve: row.autoResolve !== false, ...support };
 }
 export function createExtensions({ network, artifacts, interpreter, nodeInterpreter, platform, hosts = {}, vault }) {
   const json = async (url, signal) => {
@@ -32,6 +32,7 @@ export function createExtensions({ network, artifacts, interpreter, nodeInterpre
   };
   return {
     async prepare(input, signal) {
+      if (input.autoResolve !== undefined && typeof input.autoResolve !== 'boolean') fail(400, 'invalid_setting');
       let origin = input.url ? publicUrl(input.url.replace(/^stremio:\/\//i, 'https://')).href : '';
       let manifest = origin ? await json(origin, signal) : input.manifest;
       if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) fail(400, 'manifest_required');
@@ -72,7 +73,7 @@ export function createExtensions({ network, artifacts, interpreter, nodeInterpre
       // Configured addon URLs and provider preferences never remain plaintext in state.
       delete manifest.payload; delete manifest.payloadURI;
       if (JSON.stringify(input.preferences || {}).length > 8192) fail(413, 'preferences_too_large');
-      return { id, ecosystem, runtime, manifest, origin: origin ? await vault.seal(origin) : '', artifact, enabled: true,
+      return { id, ecosystem, runtime, manifest, origin: origin ? await vault.seal(origin) : '', artifact, enabled: true, autoResolve: input.autoResolve !== false,
         preferences: await vault.seal(input.preferences || {}), priority: 0, languages: [], kind: input.kind || (manifest.type === 'manga-provider' ? 'read' : 'watch'), updatedAt: new Date().toISOString() };
     },
     async invoke(row, op, args, signal, onProgress) {
